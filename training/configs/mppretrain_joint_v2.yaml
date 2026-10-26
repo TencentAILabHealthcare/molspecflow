@@ -1,0 +1,102 @@
+# =========================================================================
+# Joint pretraining configuration. By default, starts from random weights.
+# Use --pretrained to initialize from a compatible checkpoint.
+# =========================================================================
+base: mptrain.yaml
+
+# -------------------------------------------------------------------------
+# Model: 联合任务(双向)
+# -------------------------------------------------------------------------
+model:
+  task: "joint"
+  use_mol_prior: false
+  # Clean checkpoint uses the original Gaussian/absolute-Da path. Keep every
+  # active mass feature in that representation for a controlled recovery run.
+  mz_encoder_mode: gaussian
+  mass_encoder_mode: gaussian
+  mz_head_mode: linear
+  mz_formula_head_enabled: false
+  mz_norm_scale: 1000.0
+  mz_use_relative: false
+  mz_flow_noise_scale: 1.0
+  # spectral_cos_* / loss_weights 均继承自 mptrain.yaml
+
+# -------------------------------------------------------------------------
+# Data: 8x A100(40GB) —— 沿用 joint 的 unified_mp 全量数据
+# -------------------------------------------------------------------------
+data:
+  L_paths: 1                 # 多路径数；如显存充裕可上调(如 2/4)以增强 SMILES 学习
+  batch_size: 128            # 每卡 batch；适配 A100 40GB
+  num_workers_dataloader: 16
+  max_seq_len: 190
+  # --- 按类别配比采样(谱图:分子:paired = 1:1:1) ---
+  # 原来是 ConcatDataset 按各集自然规模(ZINC 100M 主导≈96%)采样，谱/paired 被严重稀释。
+  # 设置后启用 DDP 感知的 RatioSampler，每个 batch 三类等概率(spectrum/molecule/paired)。
+  #   spectrum = spec LMDB + graph_massgym 'ms' 辅助；molecule = ZINC + 'mol' 辅助；paired = graph_massgym train
+  category_ratio:
+    spectrum: 1.0
+    molecule: 1.0
+    paired: 1.0
+  # 不设置 samples_per_epoch → 自动用 ConcatDataset 全集规模(Σ spectrum+molecule+paired)。
+  # RatioSampler 仍按上方 1:1:1 有放回采样；epoch 只决定 val/ckpt 边界，可按墙钟/步数停训。
+  # 若需缩短 epoch 做调试，可显式设 samples_per_epoch: 2000000 等。
+  sampler_seed: 0
+
+# -------------------------------------------------------------------------
+# Training: 全参数继续预训练(非微调)
+# -------------------------------------------------------------------------
+training:
+  # 热启动继续预训练用中等 lr(小于从零的 2e-4)，配合梯度裁剪平稳迁移谱表示。
+  learning_rate: 1.0e-4
+  weight_decay: 0.01
+  betas: [0.9, 0.95]
+  adam_eps: 1.0e-8
+  gradient_clip_val: 1.0     # 保护 backbone：迁移初期谱头梯度较大
+  accumulate_grad_batches: 2 # 全局有效 batch = 128 * 8 * 2 = 2048
+  num_epochs: 100            # ZINC 100M 使单个 epoch 极大，实际按墙钟/步数停
+
+  # 迁移期(旧 Da 空间 -> 归一化空间)先关掉 EMA：EMA 从旧权重起步且更新极慢，会长期滞后、
+  # 拖累验证指标，且当前 ckpt 只存实时权重(EMA 不落盘)，此阶段开 EMA 收益为负。
+  # 等模型在新空间训稳后如需 EMA，可将 use_ema 设 true 并配合 ema_start_step 延迟启动。
+  use_ema: false
+  ema_decay: 0.999
+  ema_start_step: 0          # >0 时表示延迟到该步再以平稳权重为起点初始化 EMA(仅 use_ema=true 生效)
+
+  accelerator: gpu
+  devices: 8
+  strategy: ddp
+  log_every_n_steps: 100
+  # Lightning counts train batches here; accumulate=2 means 4000 batches = 2000 optimizer steps.
+  check_val_every_n_steps: 4000
+  check_val_every_n_epochs: null
+
+  resume_path: null
+  # Optional weight initialization; pass --pretrained for a compatible checkpoint.
+  pretrained_path: null
+
+  finetune:
+    enabled: false           # task=joint 全参训练(非冻结微调)
+
+# -------------------------------------------------------------------------
+# Logging / Checkpointing
+# -------------------------------------------------------------------------
+logging:
+  project_name: "MolSpecFlow_joint_pretrain_v2"
+  run_name_prefix: "joint-v2"
+  offline_mode: true
+  save_dir: "runs"
+  checkpoint_dir: "runs/checkpoints/joint"
+  monitor: "val_loss_total"
+  mode: "min"
+  save_top_k: 5
+  save_last: true
+  early_stopping_patience: 2000
+  early_stopping_monitor: "val_loss_total"
+
+# -------------------------------------------------------------------------
+# Test: 双向都评
+# -------------------------------------------------------------------------
+test:
+  num_samples_per_example: 1
+  save_dir: runs/test_joint_v2
+  tasks: ["spec_to_smiles", "smiles_to_spec"]

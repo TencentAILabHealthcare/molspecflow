@@ -1,0 +1,104 @@
+# =========================================================================
+# Fine-tuning config: SMILES (+ ECFP fingerprint) -> Mass Spectrum simulation
+# 任务: smiles_to_spec (谱图模拟)，多路径 path=1
+# 该配置继承 mptrain.yaml，仅覆盖谱图模拟微调所需字段。
+# 输入: 固定的 SMILES tokens + ECFP 指纹 + 条件(precursor_mz/adduct/charge/energy)
+# 输出: 20 峰质谱 (mz, intensity)
+# =========================================================================
+base: mptrain.yaml
+
+# -------------------------------------------------------------------------
+# Data: path=1 (每个分子一条 SMILES 路径)
+# -------------------------------------------------------------------------
+data:
+  L_paths: 1                 # (L) path 数量，谱图模拟固定为 1
+  batch_size: 128            # 每卡 batch；H20(96GB) 可按显存上调到 256/320
+  num_workers_dataloader: 16
+  max_seq_len: 190
+
+# -------------------------------------------------------------------------
+# Model: 切换到 smiles_to_spec 任务
+# -------------------------------------------------------------------------
+model:
+  task: "smiles_to_spec"     # 主要任务：分子(+指纹) -> 谱图
+  use_mol_prior: false
+  # [已撤销归一化] 必须=1.0：归一化会让绝对 m/z 编码器失明(见 mptrain.yaml 说明)。保持 Da 原尺度。
+  mz_norm_scale: 1.0
+  spectral_cos_mz_max: 1005.0
+  spectral_cos_bin_res: 0.01
+  spectral_cos_remove_precursor: true
+  spectral_cos_t_min: 0.5
+  spectral_cos_multiscale:
+    - {bin_res: 1.0,   soft_sigma_da: 0.5,   loss_key: spectral_cos_1da}
+    - {bin_res: 0.1,   soft_sigma_da: 0.1,   loss_key: spectral_cos_0p1da}
+    - {bin_res: 0.01,  soft_sigma_da: 0.05,  loss_key: spectral_cos_0p01da}
+    - {bin_res: 0.001, soft_sigma_da: 0.005, loss_key: spectral_cos_0p001da}
+  loss_weights:
+    smiles_valid: 1.0
+    smiles_padding: 0.1
+    mz_rel: 1.0
+    mz_abs: 1.0e-4
+    intensity: 1.0
+    mass: 1.0e-6
+    spectral_cos_multiscale: 0.25
+
+# -------------------------------------------------------------------------
+# Training: 8x H20 DDP + 轻量微调(只训练谱头 + 末端融合层 + 条件编码器)
+# -------------------------------------------------------------------------
+training:
+  learning_rate: 2.0e-4      # 仅在 finetune.enabled=false 的全参路径下生效
+  weight_decay: 0.01
+  betas: [0.9, 0.95]
+  adam_eps: 1.0e-8
+  num_epochs: 200
+
+  use_ema: true
+  ema_decay: 0.999
+
+  accelerator: gpu
+  devices: 8                 # 8x H20
+  strategy: ddp
+  log_every_n_steps: 100
+  check_val_every_n_steps: 1000
+  check_val_every_n_epochs: null
+
+  resume_path: null
+  gradient_clip_val: 1.0
+  # Supplied at the command line with --pretrained.
+  pretrained_path: null
+
+  finetune:
+    enabled: true                    # task != joint，显式开启轻量微调
+    train_last_fusion_layers: 2      # 解冻末端 K 个融合层
+    train_layernorm: true
+    train_bias: true
+    train_condition_encoders: true   # 谱图模拟强依赖条件(precursor/adduct/energy)
+    train_embeddings: false
+    backbone_lr: 2.0e-6              # 解冻 backbone 小 lr
+    head_lr: 2.0e-5                 # 谱头(final_spec_ln / spec_output_projection) 大 lr
+    l2sp_lambda: 0.0
+    l2sp_ref_dtype: float16
+
+# -------------------------------------------------------------------------
+# Logging / Checkpointing
+# -------------------------------------------------------------------------
+logging:
+  project_name: "MolSpecFlow_smiles_to_spec_ft"
+  run_name_prefix: "sim-ft"
+  offline_mode: true
+  save_dir: "runs"
+  checkpoint_dir: "runs/checkpoints/smiles_to_spec"
+  monitor: "val_loss_total"
+  mode: "min"
+  save_top_k: 5
+  save_last: true
+  early_stopping_patience: 2000
+  early_stopping_monitor: "val_loss_total"
+
+# -------------------------------------------------------------------------
+# Test: 仅谱图模拟方向
+# -------------------------------------------------------------------------
+test:
+  num_samples_per_example: 1
+  save_dir: runs/test_smiles_to_spec
+  tasks: ["smiles_to_spec"]

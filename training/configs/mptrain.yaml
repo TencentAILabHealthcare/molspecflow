@@ -1,0 +1,223 @@
+# =========================================================================
+# Configuration for Unified Multi-Path SMILES and Mass Spectrum Modeling
+# 任务：统一的多路径SMILES与质谱的联合生成模型 (unified_mp)
+# =========================================================================
+
+# -------------------------------------------------------------------------
+# Data Configuration (数据配置)
+# -------------------------------------------------------------------------
+test:
+  num_samples_per_example: 100
+  save_dir: runs/test_generation_results
+  tasks: ["spec_to_smiles"]
+
+
+data:
+  # 核心任务名称，DataModule会根据此名称选择相应的数据处理逻辑
+  # task: unified_mp 
+
+  # --- Dataloader Settings (数据加载器设置) ---
+  batch_size: 320 # 批次大小 (B)。实际SMILES批次为 B * L
+  num_workers_dataloader: 16 # 数据加载时使用的工作进程数
+  num_workers_preprocess: 8 # 数据预处理时使用的工作进程数
+
+  # --- Dataset Paths (各数据集根目录) ---
+  zinc_root: "data"
+  graph_massgym_root: "data"
+  spectrum_root: "data"
+  
+  # --- Multi-Path & Tokenizer Settings (多路径与分词器设置) ---
+  tokenizer_path: "tokenizer"
+  L_paths: 1      # (L) 每个样本生成的SMILES路径数量
+  max_seq_len: 190 # (S_len) SMILES序列的最大长度
+
+# -------------------------------------------------------------------------
+# Model Architecture (模型架构配置)
+# -------------------------------------------------------------------------
+model:
+  task: "spec_to_smiles" # 主要任务，可选 "joint", "spec_to_smiles", "smiles_to_spec", "spec_to_ecfp"
+  use_mol_prior: false  # 是否使用分子骨架先验 (scaffold prior)
+  # --- 核心路径和ID ---
+  tokenizer_path: "tokenizer"
+  vocab_size: 8000  # !!! 必须与你的 tokenizer 词汇表大小一致
+  pad_token_id: 0   # !!! 必须与你的 tokenizer 的 padding token ID 一致
+  num_adducts: 5    # 你的 adduct_embedding 词汇表大小 (例如: 0:[M+H]+, 1:[M+Na]+, ...)
+
+  # --- Transformer/Fusion Block Dimensions (网络维度设置) ---
+  num_layers: 8        # 融合层/Transformer层数
+  d_model: 512        # SMILES Token 嵌入维度
+  d_spec: 256         # 谱图峰 嵌入维度
+  cond_dim: 256       # 条件向量维度
+  n_heads: 8          # 多头注意力头数
+  d_ff: 2048          # 前馈网络中间层维度 (d_model * 4)
+  dropout: 0.1        # Dropout概率
+  max_pos_len: 5000 # 最大位置编码长度 (用于smiles的位置编码)
+  # --- Embedding Dimensions (嵌入配置) ---
+  time_embed_dim: 256 # 时间 t 的嵌入维度
+  
+  # --- Gaussian Basis (高斯基函数) ---
+  # 用于 (m/z, intensity, mass) 等连续值的编码
+  mass_num_basis: 128
+  cum_mass_num_basis: 128
+  total_mass_max_val: 1005.0 # 与 MSG / grid 对齐（原 1500 大分子覆盖不足）
+  
+  mz_num_basis: 128
+  mz_max_val: 5000.0         # 预期的最大 m/z 值
+  intensity_num_basis: 64
+  intensity_sinusoidal_dim: 128
+  intensity_fourier_num_wavelengths: 256
+  intensity_wavelength_min: 1.0e-4
+  intensity_wavelength_max: 1.0
+  # m/z hybrid encoder：粗高斯 + ICLR 多尺度 sinusoidal + MSG Fourier(6000 sin/cos)
+  mz_encoder_mode: hybrid      # hybrid | gaussian（仅高斯，兼容旧行为）
+  mz_use_coarse_gaussian: true
+  mz_sinusoidal_dim: 512        # ICLR Eq.4–5，256 频率 → 512 sin/cos
+  mz_fourier_num_wavelengths: 3000  # ×2 = 6000 Fourier 特征（MSG DeepSets 同款量级）
+  mz_wavelength_min_da: 0.0031622776601683795   # 10^-2.5 Da
+  mz_wavelength_max_da: 1995.2623149688796       # 10^3.3 Da
+  # 所有 Da 标量（token mass / total mass / adduct / peak mz）共用 hybrid encoder
+  mass_encoder_mode: hybrid
+  # token mass ↔ 峰 m/z cross-attn（仅 paired）；m/z 头：formula(方案A) / grid / linear
+  token_mass_peak_attn_heads: 4
+  peak_token_mass_cross_attn_heads: 4
+  mz_head_mode: formula          # formula | grid | linear
+  mz_formula_head_enabled: true  # 兼容旧键；优先看 mz_head_mode
+  formula_max_count: 64.0         # 每元素 soft 计数上界
+  formula_candidate_k: 32         # 从局部整数 formula 中保留离旧 m/z proposal 最近的 K 个
+  formula_candidate_temperature_da: 5.0  # scorer 中 proposal 距离先验的温度
+  formula_scorer_dim: 64
+  mz_grid_enabled: false         # grid 头关闭（改用 formula）
+  mz_grid_num_bins: 512
+  mz_grid_max_da: 1005.0
+  mz_grid_residual_max_da: 0.5
+
+  # --- m/z 归一化 & 谱余弦损失 ---
+  # [已撤销归一化] mz_norm_scale 必须=1.0：模型的绝对 m/z 编码器(mz_encoder)按 0~5000 Da 标定、
+  # 最小 σ≈4 Da。若把 m/z 归一化到 O(1) 再喂进去，所有 m/z 会落进同一个高斯基桶(实测跨输入
+  # embedding 余弦 0.999)，模型对绝对 m/z 彻底失明。保持 Da 原尺度让编码器正常工作。
+  mz_norm_scale: 1.0
+  # MassSpecGym 谱余弦损失：与 eval 相同(0.01 Da 分箱 / max 1005 / L2 / 剔除前体离子 bin)
+  spectral_cos_mz_max: 1005.0
+  spectral_cos_bin_res: 0.01
+  spectral_cos_remove_precursor: true
+  spectral_cos_t_min: 0.5
+  # 动态生成 log-space 分箱尺度：10 Da + 5→0.01 Da 的 7 个对数等距点。
+  # 所有尺度共享一个总 loss 权重，增加尺度不会增加总梯度预算。
+  spectral_cos_logspace:
+    enabled: true
+    max_bin_res: 5.0
+    min_bin_res: 0.01
+    num_scales: 7
+    extra_bin_res: [10.0]
+    soft_sigma_ratio: 1.0
+    soft_sigma_min_da: 0.01
+  # Huber(smooth-L1) 带宽(Da)：m/z relative/absolute loss 均实际使用该带宽，
+  # 让大误差处梯度被截断(防爆炸)、小误差处二次(精细)，
+  # 从而可以把下方 mz / mass 权重调大而不炸。beta 越小越接近 L1(更鲁棒、更强稳定牵引)。
+  mz_huber_beta: 10.0
+  mass_huber_beta: 10.0
+  # 流匹配 S_0 / generate 初值中 m/z 通道的高斯 σ(Da)；intensity 仍 N(0,1)。
+  # 典型 peak m/z std≈100–150 Da；设为 1 则 m/z 路径退化为从 ~0 Da 线性爬升(旧行为)。
+  mz_flow_noise_scale: 150.0
+  # 谱 flow / loss 在相对 precursor 空间(Δm = prec - m/z)；encoder 仍用绝对 Da。
+  mz_use_relative: true
+  # 70%覆盖完整轨迹，30%加强终点附近的高精度监督。
+  time_sampling:
+    uniform_ratio: 0.7
+    endpoint_beta_a: 5.0
+    endpoint_beta_b: 1.0
+  mz_da_t_min: 0.5
+  mz_ppm_t_min: 0.8
+  spectral_cos_fine_t_min: 0.8
+  spectral_cos_ultrafine_t_min: 0.9
+  # RelativeMzBias 无 precursor 时的 fallback 尺度(Da)；默认 min(mz_max, 1005) 贴近 MSG。
+  mz_bias_ref_scale: 1005.0
+  
+  total_mass_num_basis: 128
+
+  # --- 关键: Token 质量列表 ---
+  # !!! 这是一个长度必须等于 vocab_size 的列表
+  # !!! 列表的索引 = token ID, 列表的值 = 对应 token 的单同位素质量
+  # !!! data_module.py 中的 create_index2weight_map 会计算这个，
+  # !!! 你需要将那个函数的输出 (一个 tensor) 转换成一个 Python 列表并粘贴在这里。
+  # 这是一个占位符 (Placeholder):
+  atom_masses: [] 
+
+  # --- Loss Weights (损失函数权重) ---
+  # 对应 MeteorFlowMatcher 中的损失
+  loss_weights:
+    smiles_valid: 1.0     # 真实SMILES token的损失
+    smiles_padding: 0.1   # [PAD] token的损失
+    # m/z：归一化 flow endpoint + 真实峰上的物理 Da / ppm Huber。
+    mz_flow: 1.0
+    mz_rel: 1.0       # 兼容旧配置
+    mz_abs: 1.0e-4
+    mz_ppm: 1.0e-4
+    mz_total: 1.0   # 归一化组合后的总 m/z loss 权重
+    mz: 1.0         # 兼容旧配置：未设 mz_rel 时回退为此权重
+    intensity: 1.0 # 谱图强度损失(MSE，强度∈[0,1] 本身有界，无需 Huber)
+    # 所有 log-space cosine 尺度合计的总权重，而非每个尺度的权重。
+    spectral_cos_multiscale: 0.1
+    # --- token 的总质量控制保持 1e-3，同样用 Huber 截断 ---
+    # 总质量=对 190 个位置的期望质量求和，未训练时 softmax 均匀会使预测质量虚高(~1.9万 Da)，
+    # 早期该项数值偏大属正常(随 SMILES 训练迅速回落)；Huber+1e-3 权重避免其主导梯度、拖累 token。
+    mass: 1.0e-3       # 预测总质量的 Huber 损失
+
+# -------------------------------------------------------------------------
+# Training Configuration (训练流程配置)
+# -------------------------------------------------------------------------
+training:
+  # --- Core Training Parameters (核心训练参数) ---
+  learning_rate: 2e-4        # joint 全参训练用
+  weight_decay: 0.01
+  betas: [0.9, 0.95]
+  adam_eps: 1e-8
+  num_epochs: 5000
+
+  use_ema: true
+  ema_decay: 0.999
+
+  # --- PyTorch Lightning Trainer Settings (PL训练器设置) ---
+  accelerator: gpu
+  devices: -1 # 使用所有可用的GPU
+  strategy: ddp # 分布式训练策略
+  log_every_n_steps: 100 # 每100步记录一次日志
+  check_val_every_n_steps: 2000 # 每2000步验证/生成样例/保存 checkpoint
+  check_val_every_n_epochs: null
+
+  # --- Fine-tuning/Resuming (微调/断点续训) ---
+  resume_path: null
+  pretrained_path: null
+
+  finetune:
+    enabled: False            # auto: task != "joint" 自动启用；也可 true/false 强制
+    train_last_fusion_layers: 2
+    train_layernorm: true
+    train_bias: true
+    train_condition_encoders: true
+    train_embeddings: false  # 小数据强烈建议 false
+
+    backbone_lr: 2e-6        # 解冻的 backbone（少量层）用小 lr
+    head_lr: 2e-5            # task head 用大 lr
+
+    l2sp_lambda: 0.0         # >0 开启（例如 1e-3），进一步抑制过拟合/漂移
+    l2sp_ref_dtype: float16  # 缓存预训练权重用 fp16 节省内存
+
+# -------------------------------------------------------------------------
+# Logging and Checkpointing (日志与检查点配置)
+# -------------------------------------------------------------------------
+logging:
+  # --- WandB Logger ---
+  project_name: "MolSpecFlow_Unified_MP"
+  run_name_prefix: "mp-exp" # 实验名称前缀
+  offline_mode: true # 是否离线运行WandB
+  save_dir: "runs"
+
+  # --- Model Checkpointing (模型保存) ---
+  checkpoint_dir: "runs/checkpoints"
+  monitor: "val_loss_total" # 监控用于保存最佳模型的指标
+  mode: "min"
+  save_top_k: 5
+  save_last: true
+  early_stopping_patience: 2000
+  early_stopping_monitor: "val_loss_total"

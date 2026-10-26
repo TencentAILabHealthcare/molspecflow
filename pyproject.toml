@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "molspecflow-core"
+version = "0.1.0"
+description = "Core hybrid flow model components for molecule and mass spectrum modeling"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "torch>=2.3",
+  "numpy>=1.24",
+  "rdkit>=2023.9",
+  "tqdm>=4.66",
+]
+
+[project.optional-dependencies]
+inference = [
+  "transformers>=4.35",
+  "deepsmiles>=1.0",
+  "pyyaml>=6.0",
+  "easydict>=1.10",
+]
+training = [
+  "pytorch-lightning>=2.2",
+  "wandb>=0.16",
+  "transformers>=4.35",
+  "deepsmiles>=1.0",
+  "lmdb>=1.4",
+  "pandas>=2.0",
+  "easydict>=1.10",
+  "sympy>=1.12",
+  "pyyaml>=6.0",
+]
+evaluation = [
+  "massspecgym==1.3.1",
+]
+
+[tool.setuptools.packages.find]
+include = ["molspecflow*", "training*", "evaluation*"]
+
+[tool.setuptools.package-data]
+training = ["configs/*.yaml"]

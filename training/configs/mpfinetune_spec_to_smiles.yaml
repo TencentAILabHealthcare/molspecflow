@@ -1,0 +1,71 @@
+# =========================================================================
+# 微调配置: Spectrum -> SMILES (de novo 分子生成, spec_to_smiles)
+# Provide a compatible joint checkpoint with --pretrained.
+# 谱余弦损失对本任务不适用(仅 smiles_to_spec/joint 生成谱时启用)，
+# 主损失为 SMILES 交叉熵；归一化让谱图输入编码更良态。
+# =========================================================================
+base: mptrain.yaml
+
+data:
+  L_paths: 1                 # de novo 可用 L>1(多路径)增强 SMILES 学习；显存允许可上调
+  batch_size: 128
+  num_workers_dataloader: 16
+  max_seq_len: 190
+
+model:
+  task: "spec_to_smiles"
+  use_mol_prior: false
+  # mz_norm_scale / spectral_cos_sigma_da / loss_weights 继承自 mptrain.yaml
+  # (spec_to_smiles 中 mz/intensity/spectral_cos 会被自动置零，不影响)
+
+training:
+  learning_rate: 2.0e-4      # 仅在 finetune.enabled=false 时生效
+  weight_decay: 0.01
+  betas: [0.9, 0.95]
+  adam_eps: 1.0e-8
+  gradient_clip_val: 1.0
+  num_epochs: 200
+
+  use_ema: true
+  ema_decay: 0.999
+
+  accelerator: gpu
+  devices: 8
+  strategy: ddp
+  log_every_n_steps: 100
+  check_val_every_n_steps: 1000
+  check_val_every_n_epochs: null
+
+  resume_path: null
+  # Supplied at the command line with --pretrained.
+  pretrained_path: null
+
+  finetune:
+    enabled: true
+    train_last_fusion_layers: 2
+    train_layernorm: true
+    train_bias: true
+    train_condition_encoders: true   # 谱图/条件编码器(输入侧)对本任务很重要
+    train_embeddings: false
+    backbone_lr: 2.0e-6
+    head_lr: 2.0e-5                   # SMILES 头(final_smiles_ln / smiles_output_projection)
+    l2sp_lambda: 0.0
+    l2sp_ref_dtype: float16
+
+logging:
+  project_name: "MolSpecFlow_spec_to_smiles_ft"
+  run_name_prefix: "s2m-ft"
+  offline_mode: true
+  save_dir: "runs"
+  checkpoint_dir: "runs/checkpoints/spec_to_smiles"
+  monitor: "val_loss_total"
+  mode: "min"
+  save_top_k: 5
+  save_last: true
+  early_stopping_patience: 2000
+  early_stopping_monitor: "val_loss_total"
+
+test:
+  num_samples_per_example: 10
+  save_dir: runs/test_spec_to_smiles
+  tasks: ["spec_to_smiles"]
