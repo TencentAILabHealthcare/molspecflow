@@ -1,32 +1,34 @@
-# MolSpecFlow
+<h1 align="center"><img src="assets/logo.png" alt="MolSpecFlow icon" width="56"> MolSpecFlow</h1>
 
-<img src="assets/logo.png" alt="MolSpecFlow logo" width="180">
+<p align="center">Molecular structure and tandem mass spectrum modeling with flow matching.</p>
 
-MolSpecFlow is a flow-matching model for molecular structures and tandem mass spectra. This repository provides the model, training configurations, inference command, and a MassSpecGym metric adapter.
+<p align="center"><a href="#quick-start">Quick start</a> · <a href="#inference-tasks">Inference tasks</a> · <a href="#training">Training</a> · <a href="#massspecgym-evaluation">Evaluation</a></p>
 
-Supported inference tasks:
+MolSpecFlow connects MS/MS spectra, molecular structures, and molecular fingerprints in one model. This repository contains the model, inference command, pretraining and fine-tuning configurations, and a MassSpecGym metric adapter.
 
-- MS/MS spectrum → molecular structures (`spec_to_smiles`)
-- molecular structure → MS/MS spectrum (`smiles_to_spec`)
-- MS/MS spectrum → 2048-bit molecular fingerprint (`spec_to_ecfp`)
+| Task | Input | Output |
+| --- | --- | --- |
+| `spec_to_smiles` | MS/MS spectrum | SMILES candidates |
+| `smiles_to_spec` | SMILES | Predicted m/z and intensity arrays |
+| `spec_to_ecfp` | MS/MS spectrum | 2048-bit molecular fingerprint |
 
-## Quick start: inference
+## Quick start
 
-Use Python 3.10 or newer. Install from this directory:
+Python 3.10 or newer is required. Install the inference dependencies from the repository root:
 
 ```bash
 python -m pip install -e '.[inference]'
 ```
 
-Place a compatible training checkpoint at `checkpoints/model.ckpt` and its matching Hugging Face tokenizer at `tokenizer/`. The checkpoint must contain the MolSpecFlow model weights and training config; if it does not contain the config, pass `--config training/configs/<matching-config>.yaml`. Only load checkpoints and tokenizers from sources you trust.
+Put a compatible checkpoint at `checkpoints/model.ckpt` and its matching Hugging Face tokenizer at `tokenizer/`. Use a checkpoint fine-tuned for the task you want to run. If it does not embed its training configuration, add `--config training/configs/<matching-config>.yaml`. Only load checkpoints and tokenizers from sources you trust.
 
-To generate molecular structures, create `inputs/spectra.jsonl` with one JSON object per line:
+For spectrum-to-structure inference, create `inputs/spectra.jsonl` with one spectrum per line:
 
 ```json
 {"identifier":"example_1","precursor_mz":181.0707,"adduct":"[M+H]+","collision_energy":30,"mz":[43.0184,77.0386,105.0335],"intensity":[0.3,0.7,1.0]}
 ```
 
-Then run:
+Then generate ten molecular candidates:
 
 ```bash
 python -m molspecflow.infer \
@@ -36,13 +38,34 @@ python -m molspecflow.infer \
   --num-samples 10 --steps 100
 ```
 
-Each output line contains `identifier`, an ordered `predictions` list of decoded SMILES (invalid generations are `null`), and `raw_deepsmiles`. An optional `formula` field in the input supplies molecular-formula conditioning; without it, the formula vector is zero. Spectra are sorted by intensity and truncated/padded to the 20 peaks used during training. `peaks` as `[[mz, intensity], ...]` is also accepted in place of the two arrays.
+The output is JSONL. Each record contains the input `identifier`, an ordered `predictions` list of decoded SMILES, and `raw_deepsmiles`. Invalid decoded structures appear as `null`.
 
-For molecule-to-spectrum inference, use a JSONL input such as:
+## Inference tasks
+
+### Spectrum → structure or fingerprint
+
+Use the spectrum JSONL format above for both `spec_to_smiles` and `spec_to_ecfp`. You may provide peaks as `"peaks": [[mz, intensity], ...]` instead of separate `mz` and `intensity` arrays. An optional `formula` supplies molecular-formula conditioning; without it, the formula vector is zero. Spectra are sorted by intensity and truncated or padded to 20 peaks.
+
+For fingerprint prediction, change the task and output path:
+
+```bash
+python -m molspecflow.infer \
+  --task spec_to_ecfp \
+  --checkpoint checkpoints/model.ckpt --tokenizer tokenizer \
+  --input inputs/spectra.jsonl --output runs/fingerprints.jsonl
+```
+
+Each fingerprint record contains `ecfp_bits`.
+
+### Structure → spectrum
+
+Create `inputs/molecules.jsonl`:
 
 ```json
 {"identifier":"example_2","smiles":"CCO","adduct":"[M+H]+","collision_energy":30}
 ```
+
+Run:
 
 ```bash
 python -m molspecflow.infer \
@@ -51,7 +74,7 @@ python -m molspecflow.infer \
   --input inputs/molecules.jsonl --output runs/spectra.jsonl
 ```
 
-The output contains `pred_mz` and `pred_int` arrays. For fingerprint inference, use the spectrum input format and `--task spec_to_ecfp`; the output contains `ecfp_bits`. Use a checkpoint trained or fine-tuned for the selected task. The command accepts `--device cpu` or `--device cuda` and `--seed` for reproducibility.
+Each spectrum record contains `pred_mz` and `pred_int` arrays. The command also accepts `--device cpu` or `--device cuda`, and `--seed` for reproducibility.
 
 ## Training
 
@@ -61,15 +84,15 @@ Install the training dependencies:
 python -m pip install -e '.[training]'
 ```
 
-The default training configs expect `data/raw/mass_spec_gym.csv`, `data/raw/GeMS_A.csv`, `data/raw/zinc100m/{train,valid,test}.csv`, and `tokenizer/`. The paired CSV needs `smiles`, `spectrum`, `PARENT_MASS`, `ADDUCT`, `COLLISION_ENERGY`, and `FOLD` columns. Paths can be changed with `--data-root`, `--tokenizer`, and `--output-dir`.
+The default configurations use `data/raw/mass_spec_gym.csv`, `data/raw/GeMS_A.csv`, `data/raw/zinc100m/{train,valid,test}.csv`, and `tokenizer/`. The paired-spectrum CSV needs `smiles`, `spectrum`, `PARENT_MASS`, `ADDUCT`, `COLLISION_ENERGY`, and `FOLD` columns. Override locations with `--data-root`, `--tokenizer`, and `--output-dir`.
 
-Joint pretraining:
+Start joint pretraining:
 
 ```bash
 python -m training.mptrain --config training/configs/mppretrain_joint_v2.yaml
 ```
 
-Task fine-tuning from a compatible joint checkpoint:
+Fine-tune from a compatible joint checkpoint for each downstream task:
 
 ```bash
 python -m training.mptrain --config training/configs/mpfinetune_spec_to_smiles.yaml --pretrained checkpoints/joint.ckpt
@@ -77,9 +100,11 @@ python -m training.mptrain --config training/configs/mpfinetune_smiles_to_spec.y
 python -m training.mptrain --config training/configs/mpfinetune_spec_to_ecfp.yaml --pretrained checkpoints/joint.ckpt
 ```
 
-The supplied configs use eight devices by default; adjust `training.devices`, batch size, and workers for your hardware. `--debug` runs a small single-device check.
+The supplied configurations use eight devices by default. Adjust `training.devices`, batch size, and worker count for your hardware; `--debug` runs a small single-device check.
 
-The molecular training losses are SMILES token cross-entropy, total-mass Huber loss, and molecular-formula Huber loss. Fingerprint prediction uses regression loss. Spectrum generation uses m/z, intensity, and multi-resolution binned cosine losses. The code does not implement a separate molecular graph-topology loss.
+### Training objectives
+
+Structure prediction combines SMILES token cross-entropy with total-mass and molecular-formula Huber losses. Fingerprint prediction uses a regression loss. Spectrum generation combines m/z, intensity, and multi-resolution binned-cosine losses. There is no separate molecular graph-topology loss.
 
 ## MassSpecGym evaluation
 
@@ -101,10 +126,10 @@ python -m evaluation.massspecgym_official simulation \
   --output runs/simulation_metrics.json
 ```
 
-De novo scoring uses the official top-1/top-10 InChIKey exact match, maximum Morgan Tanimoto, and MCES distance definitions. Simulation scoring uses the official simulation-challenge test subset, `SpecToMzsInts` reference-spectrum transform, and sparse cosine, square-root cosine, and Jensen–Shannon metrics. Prediction records should carry the MassSpecGym `identifier`; older test-order outputs can use `--legacy-index-order` after a SMILES identity check. The scorer reports how many test examples were covered.
+De novo scoring uses top-1/top-10 InChIKey exact match, maximum Morgan Tanimoto, and MCES distance. Simulation scoring uses the simulation-challenge test subset, the `SpecToMzsInts` reference-spectrum transform, and sparse cosine, square-root cosine, and Jensen–Shannon metrics. Prediction records should carry the MassSpecGym `identifier`; older test-order outputs can use `--legacy-index-order` after a SMILES identity check. The scorer reports test-example coverage.
 
-## Repository contents
+## Repository layout
 
-- `molspecflow/`: model, flow matcher, spectrum loss, formula utilities, and inference CLI
-- `training/`: data loaders, training entry point, and pretraining/fine-tuning configs
-- `evaluation/`: offline MassSpecGym metric adapter
+- `molspecflow/` — model, flow matcher, losses, formula utilities, and inference CLI
+- `training/` — data loaders, training entry point, and pretraining/fine-tuning configurations
+- `evaluation/` — MassSpecGym metric adapter
